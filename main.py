@@ -7,6 +7,9 @@ import sys
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+RESOLVE_LIFETIME = 5
+XFR_TIMEOUT = 10
+
 def setup_argparse():
     """
     Sets up the argument parser for the script.
@@ -20,72 +23,52 @@ def setup_argparse():
 
 def attempt_zone_transfer(domain, nameserver):
     """
-    Attempts a DNS zone transfer (AXFR) against the specified nameserver for the given domain.
-
-    Args:
-        domain (str): The domain to check.
-        nameserver (str): The nameserver to target.
+    Attempts a DNS zone transfer (AXFR) against the specified nameserver.
 
     Returns:
-        str: The zone data if the transfer is successful, None otherwise.
+        tuple: (outcome, zone_text_or_None) where outcome is one of
+        "success" (transfer allowed, zone text returned), "refused" (the
+        nameserver was reached and definitively refused or failed the
+        transfer, a real negative), or "unanswered" (timeout or a transport
+        error, so no verdict about that server was earned).
     """
     try:
         logging.info(f"Attempting zone transfer from {nameserver} for {domain}...")
-        resolver = dns.resolver.Resolver()
-        resolver.nameservers = [nameserver]
-
-        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=10)) #timeout added for safety
-
+        zone = dns.zone.from_xfr(dns.query.xfr(nameserver, domain, timeout=XFR_TIMEOUT, lifetime=XFR_TIMEOUT))
         logging.info(f"Zone transfer successful from {nameserver} for {domain}.")
-        return str(zone)
-    except dns.exception.FormError as e: #Catch form error and log
+        return "success", zone.to_text()
+    except dns.query.TransferError as e:
+        logging.error(f"Transfer refused by {nameserver} for {domain}: {e}")
+        return "refused", None
+    except dns.exception.FormError as e:
         logging.error(f"FormError when attempting zone transfer from {nameserver} for {domain}: {e}")
-        return None
-    except dns.exception.Timeout as e: #Catch timout error and log
-         logging.error(f"TimeoutError when attempting zone transfer from {nameserver} for {domain}: {e}")
-         return None
-    except dns.tsig.BadSig as e: #Catch bad signature error
-        logging.error(f"TSIG Error: {e}")
-        return None
-    except dns.query.TransferError as e:  #Catch transfer errors
-        logging.error(f"TransferError when attempting zone transfer from {nameserver} for {domain}: {e}")
-        return None
-    except Exception as e: #Catch other exceptions and log
-        logging.error(f"An unexpected error occurred: {e}")
-        return None
+        return "refused", None
+    except dns.tsig.BadSig as e:
+        logging.error(f"TSIG Error from {nameserver} for {domain}: {e}")
+        return "refused", None
+    except dns.exception.Timeout as e:
+        logging.error(f"Timeout when attempting zone transfer from {nameserver} for {domain}: {e}")
+        return "unanswered", None
+    except Exception as e:
+        logging.error(f"No answer from {nameserver} for {domain}: {e}")
+        return "unanswered", None
 
 def get_nameservers(domain):
     """
-    Retrieves the nameservers for a given domain.
+    Retrieves the nameserver addresses for a given domain.
 
-    Args:
-        domain (str): The domain to query.
+    Both A and AAAA records are resolved for each nameserver, through the
+    configured resolver, with an explicit lifetime on every query. A
+    nameserver that answers one record type and not the other is skipped
+    for that type only, never allowed to abort the whole lookup.
 
     Returns:
-        list: A list of nameserver IP addresses.  Returns None if no NS records are found.
+        list: Nameserver IP addresses, or None if no NS records are found.
     """
+    resolver = dns.resolver.Resolver()
+    resolver.lifetime = RESOLVE_LIFETIME
     try:
-        resolver = dns.resolver.Resolver()
-        nameservers = []
-        answers = resolver.resolve(domain, 'NS')  # Resolve for NS records
-        for rdata in answers:
-            nameserver = str(rdata.target)
-            # Resolve the nameserver's A record to get its IP address
-            try:
-                ip_answers = resolver.resolve(nameserver, 'A')
-                for ip_rdata in ip_answers:
-                    nameservers.append(str(ip_rdata.address))
-            except dns.resolver.NXDOMAIN:
-                logging.warning(f"Could not resolve IP address for nameserver: {nameserver}")
-            except dns.exception.Timeout:
-                logging.warning(f"Timeout resolving IP address for nameserver: {nameserver}")
-
-        if not nameservers:
-            logging.warning(f"No A records found for nameservers of domain: {domain}")
-            return None
-
-        return nameservers
-
+        answers = resolver.resolve(domain, 'NS', lifetime=RESOLVE_LIFETIME)
     except dns.resolver.NXDOMAIN:
         logging.error(f"Domain not found: {domain}")
         return None
@@ -98,6 +81,29 @@ def get_nameservers(domain):
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         return None
+
+    nameservers = []
+    for rdata in answers:
+        nameserver = str(rdata.target)
+        for rdtype in ('A', 'AAAA'):
+            try:
+                ip_answers = resolver.resolve(nameserver, rdtype, lifetime=RESOLVE_LIFETIME)
+                for ip_rdata in ip_answers:
+                    address = str(ip_rdata.address)
+                    if address not in nameservers:
+                        nameservers.append(address)
+            except dns.resolver.NoAnswer:
+                logging.warning(f"No {rdtype} record for nameserver: {nameserver} (continuing)")
+            except dns.resolver.NXDOMAIN:
+                logging.warning(f"Could not resolve IP address for nameserver: {nameserver}")
+            except dns.exception.Timeout:
+                logging.warning(f"Timeout resolving {rdtype} record for nameserver: {nameserver}")
+
+    if not nameservers:
+        logging.warning(f"No A or AAAA records found for nameservers of domain: {domain}")
+        return None
+
+    return nameservers
 
 def main():
     """
@@ -119,21 +125,29 @@ def main():
         print(f"Could not retrieve nameservers for {domain}.  Exiting.")
         sys.exit(1)
 
-    logging.info(f"Found nameservers: {nameservers}")
+    logging.info(f"Found nameserver addresses: {nameservers}")
 
-    vulnerable = False
+    tested = 0
+    refused = 0
     for nameserver in nameservers:
-        zone_data = attempt_zone_transfer(domain, nameserver)
-        if zone_data:
+        tested += 1
+        outcome, zone_data = attempt_zone_transfer(domain, nameserver)
+        if outcome == "success":
             print(f"Zone transfer successful from {nameserver} for {domain}!")
             print("--------------------------------------------------")
             print(zone_data)
             print("--------------------------------------------------")
-            vulnerable = True
-            break  # Stop after first successful transfer
+            print(f"Tested {tested} of {len(nameservers)} nameserver addresses before the successful transfer.")
+            return
+        if outcome == "refused":
+            refused += 1
 
-    if not vulnerable:
-        print(f"Zone transfer failed for all nameservers of {domain}.  Vulnerability not detected.")
+    if refused:
+        print(f"Zone transfer refused by {refused} of {tested} nameserver addresses tested for {domain}. Vulnerability not detected.")
+        return
+
+    print(f"Scan did not complete: none of the {tested} nameserver addresses tested for {domain} gave a definitive answer. No verdict is reported.")
+    sys.exit(1)
 
 if __name__ == "__main__":
     main()
