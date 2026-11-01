@@ -83,6 +83,9 @@ def get_nameservers(domain):
         return None
 
     nameservers = []
+    # Addresses are deduplicated below, nameserver hostnames are not. Two NS
+    # names that resolve to the same address still earn one transfer attempt
+    # each per distinct address only, since the list holds addresses.
     for rdata in answers:
         nameserver = str(rdata.target)
         for rdtype in ('A', 'AAAA'):
@@ -92,6 +95,10 @@ def get_nameservers(domain):
                     address = str(ip_rdata.address)
                     if address not in nameservers:
                         nameservers.append(address)
+            # Only these three failures stay local to one record type. Any
+            # other resolver error inside this loop propagates out of
+            # get_nameservers entirely, so one bad nameserver can still end
+            # the lookup even though a missing A record cannot.
             except dns.resolver.NoAnswer:
                 logging.warning(f"No {rdtype} record for nameserver: {nameserver} (continuing)")
             except dns.resolver.NXDOMAIN:
@@ -133,6 +140,8 @@ def main():
         tested += 1
         outcome, zone_data = attempt_zone_transfer(domain, nameserver)
         if outcome == "success":
+            # First success ends the run. The remaining addresses are never
+            # tried, and the count printed below says exactly how far I got.
             print(f"Zone transfer successful from {nameserver} for {domain}!")
             print("--------------------------------------------------")
             print(zone_data)
@@ -142,6 +151,9 @@ def main():
         if outcome == "refused":
             refused += 1
 
+    # One definite refusal is enough for a negative verdict and exit 0,
+    # even when the other addresses never answered. Unanswered alone is
+    # not a negative; that case falls through to the exit 1 below.
     if refused:
         print(f"Zone transfer refused by {refused} of {tested} nameserver addresses tested for {domain}. Vulnerability not detected.")
         return
