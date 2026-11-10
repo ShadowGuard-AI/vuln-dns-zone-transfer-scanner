@@ -95,16 +95,17 @@ def get_nameservers(domain):
                     address = str(ip_rdata.address)
                     if address not in nameservers:
                         nameservers.append(address)
-            # Only these three failures stay local to one record type. Any
-            # other resolver error inside this loop propagates out of
-            # get_nameservers entirely, so one bad nameserver can still end
-            # the lookup even though a missing A record cannot.
+            # Every resolver failure stays local to this one record type:
+            # a nameserver failing one lookup must never abort the whole
+            # scan or hide the remaining nameservers.
             except dns.resolver.NoAnswer:
                 logging.warning(f"No {rdtype} record for nameserver: {nameserver} (continuing)")
             except dns.resolver.NXDOMAIN:
                 logging.warning(f"Could not resolve IP address for nameserver: {nameserver}")
             except dns.exception.Timeout:
                 logging.warning(f"Timeout resolving {rdtype} record for nameserver: {nameserver}")
+            except dns.exception.DNSException as e:
+                logging.warning(f"Could not resolve {rdtype} record for nameserver: {nameserver}: {e} (continuing)")
 
     if not nameservers:
         logging.warning(f"No A or AAAA records found for nameservers of domain: {domain}")

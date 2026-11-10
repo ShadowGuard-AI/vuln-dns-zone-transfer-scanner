@@ -19,4 +19,4 @@ Example: `python main.py example.com`
 - `domain`: The domain to check (required, positional).
 
 ## License
-Copyright (c) ShadowGuard-AI
+MIT License (see the LICENSE file).
